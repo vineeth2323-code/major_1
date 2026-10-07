@@ -180,6 +180,7 @@ LOG_COLORS = {
     "alert": (255, 120, 110),
     "reroute": (255, 210, 60),
     "clear": (110, 220, 140),
+    "critical": (255, 80, 255),
 }
 
 FLASH_SECONDS = 3.0
@@ -210,6 +211,9 @@ class CityRenderer:
         self.banner_font = pygame.font.Font(None, 30)
         self.label_font = pygame.font.Font(None, max(14, int(cell_size * 0.9)))
         self._static: Optional[pygame.Surface] = None
+        self._explored_key: Optional[Tuple[int, int]] = None
+        self._explored_layer: Optional[pygame.Surface] = None
+        self._sensor_sprite: Optional[Tuple[int, pygame.Surface]] = None
 
     @property
     def size(self) -> Tuple[int, int]:
@@ -297,10 +301,7 @@ class CityRenderer:
         surface.blit(self.static_layer(), (0, 0))
 
         if explored:
-            overlay = pygame.Surface(self.size, pygame.SRCALPHA)
-            for cell in explored:
-                overlay.fill(COLORS["explored"], self.cell_rect(cell))
-            surface.blit(overlay, (0, 0))
+            surface.blit(self._explored_overlay(explored), (0, 0))
 
         if len(ghost_path) >= 2 and ghost_strength > 0:
             ghost = pygame.Surface(self.size, pygame.SRCALPHA)
@@ -336,10 +337,20 @@ class CityRenderer:
         self._draw_hud(surface, hud_lines)
         self._draw_log(surface, log_entries)
 
+    def _explored_overlay(self, explored: Sequence[Cell]) -> pygame.Surface:
+        """A* search footprint; cached until the route (and so the explored set) changes."""
+        key = (id(explored), len(explored))
+        if self._explored_layer is None or key != self._explored_key:
+            overlay = pygame.Surface(self.size, pygame.SRCALPHA)
+            for cell in explored:
+                overlay.fill(COLORS["explored"], self.cell_rect(cell))
+            self._explored_layer, self._explored_key = overlay, key
+        return self._explored_layer
+
     def _draw_incidents(self, surface: pygame.Surface, incidents: Sequence, now: float) -> None:
         if not incidents:
             return
-        pulses = pygame.Surface(self.size, pygame.SRCALPHA)
+        pulses = None
         for inc in incidents:
             age = max(0.0, now - inc.reported_at)
             rect = self.cell_rect(inc.cell)
@@ -351,25 +362,38 @@ class CityRenderer:
             if age < PULSE_SECONDS:
                 t = age / PULSE_SECONDS
                 radius = int(self.cell_size * (0.7 + 3.0 * t))
+                if pulses is None:
+                    pulses = pygame.Surface(self.size, pygame.SRCALPHA)
                 pygame.draw.circle(pulses, (*COLORS["pulse"], int(220 * (1 - t))), rect.center, radius, 3)
-        surface.blit(pulses, (0, 0))
+        if pulses is not None:
+            surface.blit(pulses, (0, 0))
 
     def _draw_perception(self, surface: pygame.Surface, perception, vehicle, now: float) -> None:
         cs = self.cell_size
-        overlay = pygame.Surface(self.size, pygame.SRCALPHA)
         if vehicle is not None:
-            center = self.to_pixel(vehicle.position)
             radius = int(perception.sensor.range * cs)
-            pygame.draw.circle(overlay, (*COLORS["sensor"], 18), center, radius)
-            pygame.draw.circle(overlay, (*COLORS["sensor"], 90), center, radius, 1)
-        arm = max(2, int(cs * 0.2))
-        for z, age in perception.recent_measurements(now):
-            x, y = self.to_pixel(z)
-            alpha = int(255 * max(0.15, 1.0 - age / 0.4))
-            color = (*COLORS["measurement"], alpha)
-            pygame.draw.line(overlay, color, (x - arm, y - arm), (x + arm, y + arm), 2)
-            pygame.draw.line(overlay, color, (x - arm, y + arm), (x + arm, y - arm), 2)
-        surface.blit(overlay, (0, 0))
+            if self._sensor_sprite is None or self._sensor_sprite[0] != radius:
+                sprite = pygame.Surface((2 * radius + 2, 2 * radius + 2), pygame.SRCALPHA)
+                pygame.draw.circle(sprite, (*COLORS["sensor"], 18), (radius + 1, radius + 1), radius)
+                pygame.draw.circle(sprite, (*COLORS["sensor"], 90), (radius + 1, radius + 1), radius, 1)
+                self._sensor_sprite = (radius, sprite)
+            sprite = self._sensor_sprite[1]
+            surface.blit(sprite, sprite.get_rect(center=self.to_pixel(vehicle.position)))
+        measurements = perception.recent_measurements(now)
+        if measurements:
+            # Small alpha layer spanning just the readings (they are all within sensor range).
+            arm = max(2, int(cs * 0.2))
+            pts = [self.to_pixel(z) for z, _ in measurements]
+            x0, y0 = min(p[0] for p in pts) - arm - 2, min(p[1] for p in pts) - arm - 2
+            w = int(max(p[0] for p in pts) - x0 + arm + 3)
+            h = int(max(p[1] for p in pts) - y0 + arm + 3)
+            layer = pygame.Surface((w, h), pygame.SRCALPHA)
+            for (x, y), (_, age) in zip(pts, measurements):
+                x, y = x - x0, y - y0
+                color = (*COLORS["measurement"], int(255 * max(0.15, 1.0 - age / 0.4)))
+                pygame.draw.line(layer, color, (x - arm, y - arm), (x + arm, y + arm), 2)
+                pygame.draw.line(layer, color, (x - arm, y + arm), (x + arm, y - arm), 2)
+            surface.blit(layer, (int(x0), int(y0)))
 
         dot = max(3, int(cs * 0.17))
         for ob in perception.obstacles:

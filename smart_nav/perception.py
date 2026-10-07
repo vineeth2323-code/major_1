@@ -207,6 +207,19 @@ class ObstacleField:
         self.obstacles.append(ob)
         return ob
 
+    def place_stationary(self, position: Sequence[float], kind: str = "pedestrian") -> MovingObstacle:
+        """An obstacle that stands still at ``position`` (e.g. someone stopped on the goal marker)."""
+        r, c = float(position[0]), float(position[1])
+        ob = self.make("h", int(round(r)), c, side=1, kind=kind, speed=0.0)
+        ob.offset = ob.cross_target = r - ob.line
+        ob.can_cross = False
+        return ob
+
+    def remove(self, obstacle_id: int) -> bool:
+        before = len(self.obstacles)
+        self.obstacles = [ob for ob in self.obstacles if ob.id != obstacle_id]
+        return len(self.obstacles) < before
+
     def spawn_random(self) -> MovingObstacle:
         city, bs = self.city, self.city.block_size
         for _ in range(100):
@@ -572,22 +585,23 @@ class PerceptionSystem:
         self.stats = TrackingStats()
         self.assessment = ThreatAssessment(CRUISE, float("inf"))
         self.trails: Dict[int, Deque[Tuple[float, np.ndarray]]] = {}
+        self.frame_errors: List[Tuple[float, float]] = []
 
     def step(self, now: float, dt: float, vehicle) -> ThreatAssessment:
         self.obstacles.update(dt, vehicle)
         detections = self.sensor.scan(now, vehicle.position, self.obstacles)
         self.tracker.step(now, dt, detections)
         truth_by_id = {ob.id: ob for ob in self.obstacles}
+        self.frame_errors = []
         for det in detections:
             self.trails.setdefault(det.obstacle_id, deque(maxlen=8)).append((now, det.z))
             tr = self.tracker.tracks[det.obstacle_id]
             if tr.hits >= self.tracker.min_hits:
                 truth = truth_by_id[det.obstacle_id]
-                self.stats.record(
-                    float(np.hypot(*(det.z - det.truth))),
-                    float(np.hypot(*(tr.position - det.truth))),
-                    float(np.hypot(*(tr.velocity - truth.velocity))),
-                )
+                raw_err = float(np.hypot(*(det.z - det.truth)))
+                kf_err = float(np.hypot(*(tr.position - det.truth)))
+                self.stats.record(raw_err, kf_err, float(np.hypot(*(tr.velocity - truth.velocity))))
+                self.frame_errors.append((raw_err, kf_err))
         self.assessment = assess_threats(vehicle, self.tracker.confirmed(), self.horizon)
         return self.assessment
 

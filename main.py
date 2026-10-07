@@ -35,6 +35,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--sensor-noise", type=float, default=0.35, help="sensor position noise std (cells)")
     p.add_argument("--sensor-range", type=float, default=7.0, help="sensor range (cells)")
     p.add_argument("--no-brake", action="store_true", help="disable the Kalman-based safety brake")
+    p.add_argument("--report-dir", default=None,
+                   help="write performance_report.md and analytics_summary.png to this directory")
+    p.add_argument("--max-time", type=float, default=300.0, help="watchdog: safe halt after this many sim seconds")
+    p.add_argument("--edge-case", choices=("isolate-goal", "occupy-goal"), default=None,
+                   help="force an edge case 2 s into the run (V2X isolates the goal / obstacle stops on it)")
     p.add_argument("--quiet", action="store_true", help="don't print the event log")
     return p.parse_args(argv)
 
@@ -61,6 +66,7 @@ def main(argv=None) -> int:
         sensor_noise=args.sensor_noise,
         sensor_range=args.sensor_range,
         safety_brake=not args.no_brake,
+        max_sim_time=args.max_time,
     )
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(message)s")
     exit_on_arrival = args.exit_on_arrival or (args.headless and args.frames is None)
@@ -70,7 +76,9 @@ def main(argv=None) -> int:
             from smart_nav.visualize import plot_route
 
             plot_route(sim.city, sim.route, args.plot)
-        result = sim.run(args.frames, exit_on_arrival, args.screenshot)
+        if args.edge_case:
+            _schedule_edge_case(sim, args.edge_case, at=2.0)
+        result = sim.run(args.frames, exit_on_arrival, args.screenshot, report_dir=args.report_dir)
     finally:
         sim.close()
     print(
@@ -82,7 +90,30 @@ def main(argv=None) -> int:
         f"brake_events={result.brake_events} sensor_rmse={result.sensor_rmse:.3f} "
         f"kf_rmse={result.kf_rmse:.3f} sim_time={result.sim_time:.1f}s"
     )
+    print(
+        f"outcome={result.outcome}" + (f" halt_reason='{result.halt_reason}'" if result.halt_reason else "")
+        + f" avg_frame_ms={result.avg_frame_ms:.2f} peak_frame_ms={result.peak_frame_ms:.2f} "
+        f"energy_wh={result.energy_wh:.1f} efficiency={result.efficiency_pct:.1f}%"
+    )
+    if result.report_paths:
+        print("report: " + " ".join(result.report_paths))
     return 0
+
+
+def _schedule_edge_case(sim: Simulation, kind: str, at: float) -> None:
+    """Wrap ``sim.step`` so the edge case fires once at simulated time ``at``."""
+    original = sim.step
+
+    def step(dt: float) -> None:
+        original(dt)
+        if not getattr(sim, "_edge_case_fired", False) and sim.time >= at:
+            sim._edge_case_fired = True
+            if kind == "isolate-goal":
+                sim.isolate_goal()
+            else:
+                sim.occupy_goal()
+
+    sim.step = step
 
 
 if __name__ == "__main__":

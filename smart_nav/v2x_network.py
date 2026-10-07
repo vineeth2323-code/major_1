@@ -118,10 +118,15 @@ class V2XNetwork:
         kind: Optional[str] = None,
         duration: Optional[float] = None,
         vehicle=None,
+        allow_isolation: bool = False,
     ) -> Optional[Incident]:
-        """Block ``cell`` and broadcast it. Returns ``None`` if the cell can't be blocked safely."""
+        """Block ``cell`` and broadcast it. Returns ``None`` if the cell can't be blocked safely.
+
+        ``allow_isolation`` skips the reachability check (an authority closing roads regardless), so
+        the goal may become unreachable; the vehicle must then handle it with a safe halt.
+        """
         cell = (int(cell[0]), int(cell[1]))
-        if not self.can_block(cell, vehicle):
+        if not self.can_block(cell, vehicle, allow_isolation):
             return None
         if duration is None and self.duration is not None:
             duration = self.rng.uniform(*self.duration)
@@ -146,7 +151,7 @@ class V2XNetwork:
         self._broadcast(msg)
         return msg
 
-    def can_block(self, cell: Cell, vehicle=None) -> bool:
+    def can_block(self, cell: Cell, vehicle=None, allow_isolation: bool = False) -> bool:
         """A cell is blockable if it's open road, not an endpoint, not under/just ahead of the
         vehicle (it can't brake instantly), and blocking it leaves the goal reachable."""
         city = self.city
@@ -156,6 +161,8 @@ class V2XNetwork:
             return True
         if vehicle.finished or cell in vehicle.committed_cells:
             return False
+        if allow_isolation:
+            return True
         city.passable[cell] = False
         try:
             return find_route(city.passable, vehicle.anchor, city.goal).found

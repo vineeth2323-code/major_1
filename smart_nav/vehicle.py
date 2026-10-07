@@ -34,6 +34,7 @@ class Vehicle:
         self.distance_travelled = 0.0
         self.position: Tuple[float, float] = (float(self.path[0][0]), float(self.path[0][1]))
         self.heading = self._segment_heading(0) if len(self.path) > 1 else 0.0
+        self.pulled_over = False
 
     @property
     def finished(self) -> bool:
@@ -47,6 +48,24 @@ class Vehicle:
     def completion(self) -> float:
         total = self.total_distance
         return 1.0 if total == 0 else min(1.0, self.distance_travelled / total)
+
+    @property
+    def remaining_distance(self) -> float:
+        """Distance left along the current path (to its last cell)."""
+        if self.finished:
+            return 0.0
+        rest = sum(self._segment_length(i) for i in range(self.segment, len(self.path) - 1))
+        return rest - self.progress
+
+    def resume(self, new_path: Sequence[Cell]) -> None:
+        """Continue from the cell the vehicle stopped at (end of its path) along ``new_path``."""
+        new_path = [tuple(p) for p in new_path]
+        if not new_path or new_path[0] != self.path[-1]:
+            raise ValueError(f"new path must start at {self.path[-1]}")
+        self.path = self.path[:-1] + new_path
+        self.segment = min(self.segment, len(self.path) - 1)
+        self.progress = 0.0
+        self._sync_pose()
 
     @property
     def braking(self) -> bool:
@@ -164,4 +183,9 @@ class Vehicle:
         pygame.draw.rect(car, tail, pygame.Rect(0, 1, 3, 3))
         pygame.draw.rect(car, tail, pygame.Rect(0, width - 4, 3, 3))
         rotated = pygame.transform.rotate(car, -self.heading)
-        surface.blit(rotated, rotated.get_rect(center=renderer.to_pixel(self.position)))
+        pos = np.asarray(self.position, dtype=float)
+        if self.pulled_over:
+            d = self.direction
+            pos = pos + 0.2 * np.array([d[1], -d[0]])
+            pygame.draw.circle(surface, (255, 80, 255), renderer.to_pixel(pos), int(cs * 0.75), 2)
+        surface.blit(rotated, rotated.get_rect(center=renderer.to_pixel(pos)))

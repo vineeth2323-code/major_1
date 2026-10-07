@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time as _time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
+import numpy as np
 import pygame
 
+from .analytics import RunAnalytics
 from .environment import CityGrid, CityRenderer
 from .perception import BRAKE, CRUISE, SLOW, PerceptionSystem
 from .routing import RouteResult, find_route
@@ -21,6 +24,12 @@ log = logging.getLogger("smart_nav")
 
 BANNER_SECONDS = 2.5
 GHOST_SECONDS = 3.0
+STOPPED = 0.05
+CREEP = 1.0
+
+ARRIVED, SAFE_HALT, IN_PROGRESS = "ARRIVED", "SAFE_HALT", "IN_PROGRESS"
+GOAL_ISOLATED, GOAL_OCCUPIED, PATH_OBSTRUCTED, WATCHDOG = (
+    "goal isolated", "goal occupied", "path obstructed", "watchdog timeout")
 
 
 @dataclass
@@ -48,6 +57,9 @@ class SimulationConfig:
     sensor_dropout: float = 0.05
     safety_brake: bool = True
     brake_horizon: float = 1.5
+    max_sim_time: float = 300.0
+    halt_patience: float = 15.0
+    blocked_patience: float = 5.0
 
 
 @dataclass
@@ -67,7 +79,15 @@ class SimulationResult:
     min_speed: float = 0.0
     sensor_rmse: float = 0.0
     kf_rmse: float = 0.0
+    outcome: str = IN_PROGRESS
+    halt_reason: Optional[str] = None
+    safe_halts: int = 0
+    avg_frame_ms: float = 0.0
+    peak_frame_ms: float = 0.0
+    energy_wh: float = 0.0
+    efficiency_pct: float = 0.0
     screenshot: Optional[str] = None
+    report_paths: Optional[Tuple[str, str]] = None
 
 
 @dataclass
@@ -115,6 +135,14 @@ class Simulation:
         self.drive_state = CRUISE
         self._episode_braked = False
         self._in_contact: set = set()
+        self.halt_reason: Optional[str] = None
+        self.halted_at = 0.0
+        self.safe_halts = 0
+        self.watchdog_tripped = False
+        self._blocked_time = 0.0
+        self._clear_time = 0.0
+        self._retry_at = 0.0
+        self.analytics = RunAnalytics(cfg.fps, cruise_speed=cfg.speed)
 
         self.perception: Optional[PerceptionSystem] = None
         if cfg.perception:
@@ -139,6 +167,7 @@ class Simulation:
             seed=seed,
         )
         self.network.subscribe(self._on_v2x)
+        self.scenario_seed = seed
 
         self.renderer = CityRenderer(self.city, cfg.cell_size)
         if self.screen is None or self.screen.get_size() != self.renderer.size:
@@ -154,9 +183,89 @@ class Simulation:
         self.log_entries.append(LogEntry(self.time, text, level))
         log.info("[t=%6.2fs] %s", self.time, text)
 
+    @property
+    def arrived(self) -> bool:
+        return self.vehicle.finished and self.vehicle.position == tuple(map(float, self.city.goal))
+
+    @property
+    def outcome(self) -> str:
+        if self.arrived:
+            return ARRIVED
+        return SAFE_HALT if self.halt_reason else IN_PROGRESS
+
+    @property
+    def done(self) -> bool:
+        """The mission is over: arrived, or held in a safe halt for ``halt_patience`` seconds."""
+        if self.arrived:
+            return True
+        if self.watchdog_tripped:
+            return self.vehicle.speed < 1e-6
+        return self.halt_reason is not None and self.time - self.halted_at >= self.config.halt_patience
+
+    def _enter_safe_halt(self, reason: str, detail: str) -> None:
+        if self.halt_reason is not None:
+            return
+        self.halt_reason, self.halted_at = reason, self.time
+        self.safe_halts += 1
+        self.vehicle.pulled_over = True
+        self.drive_state = BRAKE
+        self._clear_time = 0.0
+        self._retry_at = self.time + 1.0
+        where = self.vehicle.path[-1] if reason == GOAL_ISOLATED else self.vehicle.anchor
+        self.log(f"CRITICAL: {detail}", "critical")
+        self.log(f"SAFE HALT ({reason}): pulled over at {where}, holding until clear", "critical")
+        self.analytics.event(self.time, "halt", reason)
+
+    def _leave_safe_halt(self, detail: str) -> None:
+        reason = self.halt_reason
+        self.halt_reason = None
+        self.vehicle.pulled_over = False
+        self._blocked_time = 0.0
+        self.drive_state = CRUISE
+        self._episode_braked = False
+        self.log(f"RECOVERED from safe halt ({reason}): {detail}", "clear")
+        self.analytics.event(self.time, "resume", reason or "")
+
+    def _try_resume_route(self) -> bool:
+        """After a goal-isolation halt: re-plan from where the vehicle stands (or will stop)."""
+        v = self.vehicle
+        start = v.path[-1] if v.finished else v.anchor
+        result = find_route(self.city.passable, start, self.city.goal)
+        if not result.found:
+            return False
+        if v.finished:
+            v.resume(result.path)
+        else:
+            v.reroute(result.path)
+        self.route = result
+        self._leave_safe_halt(f"A* found a {int(result.cost)}-step route from {start} to the goal")
+        return True
+
+    def isolate_goal(self, duration: float = math.inf) -> int:
+        """Close every road into the goal via V2X, bypassing the reachability guard (demo/tests).
+
+        Closures are permanent unless ``duration`` (seconds) is given."""
+        gr, gc = self.city.goal
+        closed = 0
+        for cell in ((gr - 1, gc), (gr + 1, gc), (gr, gc - 1), (gr, gc + 1)):
+            if 0 <= cell[0] < self.city.rows and 0 <= cell[1] < self.city.cols and self.city.passable[cell]:
+                if self.network.report(cell, self.time, kind="road closure", duration=duration,
+                                       vehicle=self.vehicle, allow_isolation=True):
+                    closed += 1
+        return closed
+
+    def occupy_goal(self, kind: str = "pedestrian"):
+        """Put a stationary obstacle on the goal marker (demo/tests)."""
+        if self.perception is None:
+            raise RuntimeError("perception is disabled")
+        ob = self.perception.obstacles.place_stationary(self.city.goal, kind)
+        self.log(f"Obstacle #{ob.id} ({kind}) stopped on the goal marker {self.city.goal}", "alert")
+        return ob
+
     def _on_v2x(self, msg: V2XMessage) -> None:
         inc = msg.incident
         if msg.type == INCIDENT:
+            self.analytics.event(self.time, "incident", f"{inc.kind} at {inc.cell}")
             on_route = not self.vehicle.finished and inc.cell in self.vehicle.cells_ahead()
             self.log(
                 f"V2X ALERT: {inc.kind} #{inc.id} at {inc.cell}" + (" - ON ROUTE" if on_route else ""),
@@ -166,7 +275,9 @@ class Simulation:
                 self.replan(f"{inc.kind} at {inc.cell}", force=True)
         elif msg.type == CLEARED:
             self.log(f"V2X CLEAR: {inc.kind} #{inc.id} at {inc.cell} reopened", "clear")
-            if not self.vehicle.finished:
+            if self.halt_reason == GOAL_ISOLATED:
+                self._try_resume_route()
+            elif not self.vehicle.finished:
                 self.replan(f"{inc.cell} reopened", force=False)
 
     def remaining_steps(self) -> int:
@@ -187,8 +298,12 @@ class Simulation:
         old_steps = self.remaining_steps()
 
         if not result.found:
-            self.vehicle.reroute([anchor])
-            self.log(f"NO ROUTE from {anchor} to goal - holding position", "alert")
+            abandoned = self.vehicle.reroute([anchor])
+            self.ghost_path, self.ghost_time = abandoned, self.time
+            self._enter_safe_halt(
+                GOAL_ISOLATED,
+                f"NO ROUTE to goal {self.city.goal}: V2X closures isolate it",
+            )
             return True
         if not force and result.cost >= old_steps:
             return False
@@ -204,6 +319,7 @@ class Simulation:
             f"({int(result.cost) - old_steps:+d}) in {elapsed_ms:.1f} ms",
             "reroute",
         )
+        self.analytics.event(self.time, "reroute", reason)
         return True
 
     def inject_incident_on_route(self, kind: str = "accident") -> bool:
@@ -215,7 +331,9 @@ class Simulation:
         return False
 
     def hud_lines(self):
-        if self.vehicle.finished:
+        if self.halt_reason:
+            status = "SAFE HALT"
+        elif self.arrived:
             status = "ARRIVED"
         elif self.paused:
             status = "PAUSED"
@@ -226,7 +344,7 @@ class Simulation:
             f"{status} {v.completion:4.0%} | v {v.speed:3.1f}/{v.cruise_speed:g} | {self.remaining_steps()} left | "
             f"reroutes {self.reroutes} | V2X {len(self.network.active)} | t={self.time:5.1f}s"
         )
-        line2 = "[R] map [I] incident [Space] pause [Esc] quit"
+        line2 = "[R] map [I] incident [X/O] edge [Space] pause [Esc] quit"
         if self.perception is not None:
             st = self.perception.stats
             line2 += (
@@ -235,17 +353,73 @@ class Simulation:
             )
         return [line1, line2]
 
-    def _update_perception(self, dt: float) -> None:
+    def _govern_speed(self, allowed: float) -> None:
+        """Final speed command: perception limit, a smooth stop at the end of the path, watchdog."""
+        v = self.vehicle
+        limit = min(allowed, math.sqrt(2.0 * 0.8 * v.max_decel * v.remaining_distance) + 0.5)
+        if self.watchdog_tripped:
+            limit = 0.0
+        v.set_target_speed(limit)
+
+    def _check_watchdog(self) -> None:
+        if self.watchdog_tripped or self.arrived or self.time < self.config.max_sim_time:
+            return
+        self.watchdog_tripped = True
+        self.halt_reason = None
+        self._enter_safe_halt(
+            WATCHDOG, f"mission exceeded max_sim_time={self.config.max_sim_time:g}s without reaching the goal"
+        )
+
+    def _update_halt(self, dt: float, assessment) -> None:
+        """Detect a vehicle stuck behind a stationary obstacle, and recover from safe halts."""
+        v = self.vehicle
+        if self.halt_reason == GOAL_ISOLATED:
+            if self.time >= self._retry_at:
+                self._retry_at = self.time + 1.0
+                self._try_resume_route()
+            return
+        if self.halt_reason in (GOAL_OCCUPIED, PATH_OBSTRUCTED):
+            self._clear_time = self._clear_time + dt if assessment is not None and assessment.state == CRUISE else 0.0
+            if self._clear_time >= 1.0:
+                self._leave_safe_halt("obstruction cleared, resuming to the goal")
+            return
+        if self.halt_reason is not None or assessment is None or v.finished:
+            return
+        # Stopped, or only creeping towards the standoff point, behind an obstacle.
+        stuck = assessment.state != CRUISE and v.speed < CREEP
+        self._blocked_time = self._blocked_time + dt if stuck else 0.0
+        if self._blocked_time < self.config.blocked_patience:
+            return
         if self.perception is None:
             return
+        goal = np.asarray(self.city.goal, dtype=float)
+        stationary = [t for t in self.perception.tracker.confirmed() if float(np.hypot(*t.velocity)) < 0.3]
+        on_goal = [t for t in stationary if float(np.hypot(*(t.position - goal))) < 1.0]
+        if on_goal and v.remaining_distance < 4.0:
+            tr = on_goal[0]
+            self._enter_safe_halt(GOAL_OCCUPIED, f"goal {self.city.goal} occupied by stationary {tr.kind} "
+                                  f"#{tr.id} for {self._blocked_time:.0f}s")
+            return
+        tr = self.perception.tracker.tracks.get(assessment.track_id)
+        if tr is not None and tr in stationary:
+            self._enter_safe_halt(PATH_OBSTRUCTED, f"stationary {tr.kind} #{tr.id} has blocked the lane "
+                                  f"for {self._blocked_time:.0f}s")
+
+    def _update_perception(self, dt: float):
+        """Run perception and return (allowed speed, assessment)."""
+        cruise = self.vehicle.cruise_speed
+        if self.perception is None:
+            return cruise, None
         assessment = self.perception.step(self.time, dt, self.vehicle)
         if not self.config.safety_brake or self.vehicle.finished:
-            self.vehicle.set_target_speed(self.vehicle.cruise_speed)
-            return
-        self.vehicle.set_target_speed(assessment.allowed_speed)
+            return cruise, assessment
+        if self.halt_reason is not None:
+            # Hold the safe halt until the obstruction has been clear for a moment.
+            hold = self.halt_reason in (GOAL_OCCUPIED, PATH_OBSTRUCTED)
+            return (0.0 if hold else assessment.allowed_speed), assessment
         prev = self.drive_state
         if assessment.state == prev:
-            return
+            return assessment.allowed_speed, assessment
         if assessment.state != CRUISE:
             tr = self.perception.tracker.tracks.get(assessment.track_id)
             who = f"{tr.kind if tr else 'obstacle'} #{assessment.track_id}"
@@ -255,12 +429,14 @@ class Simulation:
             self.brake_events += 1
             self._episode_braked = True
             self.log(f"SAFETY BRAKE: Kalman track {who} will cross our path {when}", "alert")
+            self.analytics.event(self.time, "brake", who)
         elif assessment.state == SLOW and prev == CRUISE:
             self.log(f"CAUTION: slowing for {who} predicted to cross {when}", "alert")
         elif assessment.state == CRUISE:
             self._episode_braked = False
             self.log("Path clear - brake released, resuming cruise speed", "clear")
         self.drive_state = assessment.state
+        return assessment.allowed_speed, assessment
 
     def _check_collisions(self) -> None:
         if self.perception is None:
@@ -269,14 +445,19 @@ class Simulation:
         for oid in contact - self._in_contact:
             self.collisions += 1
             self.log(f"COLLISION with obstacle #{oid} at speed {self.vehicle.speed:.1f}", "alert")
+            self.analytics.event(self.time, "collision", f"obstacle #{oid}")
         self._in_contact = contact
 
     def step(self, dt: float) -> None:
         if self.paused:
             return
+        started = _time.perf_counter()
         self.time += dt
         self.network.update(self.time, dt, self.vehicle)
-        self._update_perception(dt)
+        allowed, assessment = self._update_perception(dt)
+        self._check_watchdog()
+        self._update_halt(dt, assessment)
+        self._govern_speed(allowed)
         self.vehicle.update(dt)
         self._check_collisions()
         if self._arrival_logged is False and self.vehicle.speed < self.min_speed:
@@ -284,17 +465,31 @@ class Simulation:
         if any(not self.city.passable[c] for c in self.vehicle.committed_cells):
             self.safety_violations += 1
             self.log(f"SAFETY: vehicle entered blocked cell near {self.vehicle.anchor}", "alert")
-        if self.vehicle.finished and not self._arrival_logged:
+        if self.arrived and not self._arrival_logged:
             self._arrival_logged = True
             self.log(f"Arrived at goal {self.city.goal} after {self.reroutes} re-route(s)", "clear")
+            self.analytics.event(self.time, "arrived", str(self.city.goal))
+        self.analytics.record(
+            self.time,
+            dt,
+            self.vehicle.speed,
+            (_time.perf_counter() - started) * 1000,
+            self.perception.frame_errors if self.perception else (),
+            "CRUISE" if self.vehicle.finished else self.drive_state,
+            self.vehicle.target_speed,
+            active=not self.done,
+        )
 
     def render(self) -> None:
+        started = _time.perf_counter()
         explored = self.route.explored if self.config.show_explored else ()
         ghost_strength = 1.0 - (self.time - self.ghost_time) / GHOST_SECONDS
         banners = []
         if self.time < self.banner_until:
             banners.append((f"V2X: DYNAMIC RE-ROUTE #{self.reroutes}", "reroute"))
-        if self.perception is not None and self.config.safety_brake and not self.vehicle.finished:
+        if self.halt_reason:
+            banners.append((f"SAFE HALT: {self.halt_reason.upper()}", "brake"))
+        elif self.perception is not None and self.config.safety_brake and not self.vehicle.finished:
             if self.drive_state == BRAKE:
                 banners.append(("SAFETY BRAKE", "brake"))
             elif self.drive_state == SLOW:
@@ -314,6 +509,7 @@ class Simulation:
             perception=self.perception,
         )
         pygame.display.flip()
+        self.analytics.add_render_time((_time.perf_counter() - started) * 1000)
 
     def _handle_events(self) -> bool:
         for event in pygame.event.get():
@@ -328,6 +524,10 @@ class Simulation:
                     self.new_scenario(None)
                 elif event.key == pygame.K_i:
                     self.inject_incident_on_route()
+                elif event.key == pygame.K_x:
+                    self.isolate_goal(duration=10.0)
+                elif event.key == pygame.K_o and self.perception is not None:
+                    self.occupy_goal()
         return True
 
     def run(
@@ -336,6 +536,7 @@ class Simulation:
         exit_on_arrival: bool = False,
         screenshot_path: Optional[str] = None,
         render: bool = True,
+        report_dir: Optional[str] = None,
     ) -> SimulationResult:
         """Run the loop. Headless runs use a fixed timestep and don't sleep.
 
@@ -353,24 +554,56 @@ class Simulation:
             frames += 1
             if max_frames is not None and frames >= max_frames:
                 break
-            if exit_on_arrival and self.vehicle.finished:
+            if exit_on_arrival and self.done:
                 break
 
         if screenshot_path:
             if not render:
                 self.render()
             self.save_screenshot(screenshot_path)
-        return self.result(frames, screenshot_path)
+        result = self.result(frames, screenshot_path)
+        if report_dir:
+            result.report_paths = self.export_report(report_dir, result)
+        return result
+
+    def report_meta(self, result: Optional[SimulationResult] = None) -> Dict[str, object]:
+        r = result or self.result(self.analytics.frames)
+        cfg = self.config
+        meta: Dict[str, object] = {
+            "Outcome": f"**{r.outcome}**" + (f" ({r.halt_reason})" if r.halt_reason else ""),
+            "Seed": self.scenario_seed,
+            "Map": f"{self.city.rows}x{self.city.cols} cells, {len(self.city.closed_segments)} road-work closures",
+            "Route": f"{self.city.start} -> {self.city.goal}, final path {r.path_length - 1} steps",
+            "Simulated time": f"{r.sim_time:.2f} s ({r.frames} frames at {cfg.fps} FPS)",
+            "V2X": f"{'on' if cfg.v2x else 'off'}, rate {cfg.incident_rate}/s",
+            "Perception": (f"{cfg.num_obstacles} obstacles, noise {cfg.sensor_noise} cells, range {cfg.sensor_range}, "
+                           f"safety brake {'on' if cfg.safety_brake else 'off'}") if cfg.perception else "off",
+            "Safety violations / collisions": f"{r.safety_violations} / {r.collisions}",
+        }
+        return meta
+
+    def export_report(self, out_dir: str, result: Optional[SimulationResult] = None) -> Tuple[str, str]:
+        """Write ``performance_report.md`` and ``analytics_summary.png`` into ``out_dir``."""
+        os.makedirs(out_dir, exist_ok=True)
+        chart = self.analytics.plot(
+            os.path.join(out_dir, "analytics_summary.png"),
+            title=f"Smart Navigation run analytics (seed {self.scenario_seed}, {self.outcome})",
+        )
+        report = self.analytics.write_report(
+            os.path.join(out_dir, "performance_report.md"), self.report_meta(result), chart
+        )
+        return report, chart
 
     def save_screenshot(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         pygame.image.save(self.screen, path)
 
-    def result(self, frames: int = 0, screenshot: Optional[str] = None) -> SimulationResult:
+    def result(self, frames: Optional[int] = None, screenshot: Optional[str] = None) -> SimulationResult:
+        lat, energy = self.analytics.latency(), self.analytics.energy_summary()
         return SimulationResult(
-            frames=frames,
+            frames=self.analytics.frames if frames is None else frames,
             sim_time=self.time,
-            reached_goal=self.vehicle.finished and self.vehicle.position == tuple(map(float, self.city.goal)),
+            reached_goal=self.arrived,
             path_length=len(self.vehicle.path),
             path_cost=float(len(self.vehicle.path) - 1),
             explored_nodes=len(self.route.explored),
@@ -383,6 +616,13 @@ class Simulation:
             min_speed=self.min_speed,
             sensor_rmse=self.perception.stats.raw_rmse if self.perception else 0.0,
             kf_rmse=self.perception.stats.kf_rmse if self.perception else 0.0,
+            outcome=self.outcome,
+            halt_reason=self.halt_reason,
+            safe_halts=self.safe_halts,
+            avg_frame_ms=lat["avg"],
+            peak_frame_ms=lat["peak"],
+            energy_wh=energy["total_wh"],
+            efficiency_pct=energy["efficiency_pct"],
             screenshot=screenshot,
         )
 
