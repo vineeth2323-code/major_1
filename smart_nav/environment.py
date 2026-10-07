@@ -9,6 +9,7 @@ is guaranteed to stay reachable.
 
 from __future__ import annotations
 
+import math
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -166,6 +167,12 @@ COLORS = {
     "banner_alt": (240, 120, 20),
     "log_bg": (16, 18, 24),
     "log_title": (150, 155, 170),
+    "obstacle": (30, 110, 255),
+    "measurement": (255, 50, 50),
+    "track": (60, 235, 120),
+    "threat": (255, 60, 60),
+    "sensor": (120, 200, 255),
+    "slow": (215, 150, 20),
 }
 
 LOG_COLORS = {
@@ -198,7 +205,7 @@ class CityRenderer:
         self.height = hud_height + self.map_height + self.log_height
         if not pygame.font.get_init():
             pygame.font.init()
-        self.font = pygame.font.Font(None, 22)
+        self.font = pygame.font.Font(None, 20)
         self.log_font = pygame.font.Font(None, 19)
         self.banner_font = pygame.font.Font(None, 30)
         self.label_font = pygame.font.Font(None, max(14, int(cell_size * 0.9)))
@@ -279,10 +286,14 @@ class CityRenderer:
         now: float = 0.0,
         ghost_path: Sequence[Cell] = (),
         ghost_strength: float = 0.0,
-        banner: Optional[str] = None,
+        banners: Sequence[Tuple[str, str]] = (),
         log_entries: Sequence[Tuple[str, str]] = (),
+        perception=None,
     ) -> None:
-        """``incidents`` need ``.cell`` and ``.reported_at``; ``log_entries`` are (text, level)."""
+        """``incidents`` need ``.cell`` and ``.reported_at``; ``banners``/``log_entries`` are (text, style).
+
+        ``perception`` is a :class:`smart_nav.perception.PerceptionSystem` (duck-typed).
+        """
         surface.blit(self.static_layer(), (0, 0))
 
         if explored:
@@ -314,11 +325,14 @@ class CityRenderer:
         self._draw_marker(surface, self.city.start, COLORS["start"], "S")
         self._draw_marker(surface, self.city.goal, COLORS["goal"], "G")
 
+        if perception is not None:
+            self._draw_perception(surface, perception, vehicle, now)
+
         if vehicle is not None:
             vehicle.draw(surface, self)
 
-        if banner:
-            self._draw_banner(surface, banner, now)
+        for i, (text, style) in enumerate(banners):
+            self._draw_banner(surface, text, now, style, self.hud_height + 28 + 38 * i)
         self._draw_hud(surface, hud_lines)
         self._draw_log(surface, log_entries)
 
@@ -340,10 +354,61 @@ class CityRenderer:
                 pygame.draw.circle(pulses, (*COLORS["pulse"], int(220 * (1 - t))), rect.center, radius, 3)
         surface.blit(pulses, (0, 0))
 
-    def _draw_banner(self, surface: pygame.Surface, text: str, now: float) -> None:
-        color = COLORS["banner"] if int(now / 0.25) % 2 == 0 else COLORS["banner_alt"]
+    def _draw_perception(self, surface: pygame.Surface, perception, vehicle, now: float) -> None:
+        cs = self.cell_size
+        overlay = pygame.Surface(self.size, pygame.SRCALPHA)
+        if vehicle is not None:
+            center = self.to_pixel(vehicle.position)
+            radius = int(perception.sensor.range * cs)
+            pygame.draw.circle(overlay, (*COLORS["sensor"], 18), center, radius)
+            pygame.draw.circle(overlay, (*COLORS["sensor"], 90), center, radius, 1)
+        arm = max(2, int(cs * 0.2))
+        for z, age in perception.recent_measurements(now):
+            x, y = self.to_pixel(z)
+            alpha = int(255 * max(0.15, 1.0 - age / 0.4))
+            color = (*COLORS["measurement"], alpha)
+            pygame.draw.line(overlay, color, (x - arm, y - arm), (x + arm, y + arm), 2)
+            pygame.draw.line(overlay, color, (x - arm, y + arm), (x + arm, y - arm), 2)
+        surface.blit(overlay, (0, 0))
+
+        dot = max(3, int(cs * 0.17))
+        for ob in perception.obstacles:
+            center = self.to_pixel(ob.position)
+            pygame.draw.circle(surface, (255, 255, 255), center, dot + 1)
+            pygame.draw.circle(surface, COLORS["obstacle"], center, dot)
+            if ob.kind == "cyclist":
+                pygame.draw.circle(surface, (10, 30, 90), center, max(1, dot // 2))
+
+        threat_id = perception.assessment.track_id if perception.assessment.state != "CRUISE" else None
+        ring = max(5, int(cs * 0.45))
+        for tr in perception.tracker.confirmed():
+            cx, cy = self.to_pixel(tr.position)
+            color = COLORS["threat"] if tr.id == threat_id else COLORS["track"]
+            pygame.draw.circle(surface, color, (cx, cy), ring, 3 if tr.id == threat_id else 2)
+            vr, vc = tr.velocity
+            if math.hypot(vr, vc) > 0.1:
+                ex, ey = cx + vc * cs * 0.8, cy + vr * cs * 0.8
+                pygame.draw.line(surface, color, (cx, cy), (ex, ey), 2)
+                ang = math.atan2(ey - cy, ex - cx)
+                head = max(4, cs // 4)
+                pygame.draw.polygon(surface, color, [
+                    (ex, ey),
+                    (ex - head * math.cos(ang - 0.5), ey - head * math.sin(ang - 0.5)),
+                    (ex - head * math.cos(ang + 0.5), ey - head * math.sin(ang + 0.5)),
+                ])
+            if tr.id == threat_id and vehicle is not None:
+                pygame.draw.line(surface, COLORS["threat"], self.to_pixel(vehicle.position), (cx, cy), 1)
+
+    def _draw_banner(self, surface: pygame.Surface, text: str, now: float, style: str = "reroute", y: Optional[int] = None) -> None:
+        flash = int(now / 0.25) % 2 == 0
+        if style == "slow":
+            color = COLORS["slow"]
+        elif style == "brake":
+            color = COLORS["threat"] if flash else (150, 20, 20)
+        else:
+            color = COLORS["banner"] if flash else COLORS["banner_alt"]
         label = self.banner_font.render(text, True, (255, 255, 255))
-        box = label.get_rect(center=(self.width // 2, self.hud_height + 28)).inflate(24, 12)
+        box = label.get_rect(center=(self.width // 2, y if y is not None else self.hud_height + 28)).inflate(24, 12)
         pygame.draw.rect(surface, color, box, border_radius=8)
         pygame.draw.rect(surface, (255, 255, 255), box, 2, border_radius=8)
         surface.blit(label, label.get_rect(center=box.center))

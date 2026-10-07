@@ -5,20 +5,30 @@ from __future__ import annotations
 import math
 from typing import List, Sequence, Tuple
 
+import numpy as np
 import pygame
 
 Cell = Tuple[int, int]
 
+VEHICLE_HALF_LENGTH = 0.55
+VEHICLE_HALF_WIDTH = 0.3
+
 
 class Vehicle:
-    def __init__(self, path: Sequence[Cell], speed: float = 6.0) -> None:
-        """``speed`` is in grid cells per second."""
+    def __init__(
+        self, path: Sequence[Cell], speed: float = 6.0, max_accel: float = 4.0, max_decel: float = 12.0
+    ) -> None:
+        """``speed`` is the cruise speed in grid cells per second; accel/decel in cells/s^2."""
         if not path:
             raise ValueError("Vehicle needs a non-empty path")
         if speed <= 0:
             raise ValueError("speed must be positive")
         self.path: List[Cell] = [tuple(p) for p in path]
+        self.cruise_speed = speed
         self.speed = speed
+        self.target_speed = speed
+        self.max_accel = max_accel
+        self.max_decel = max_decel
         self.segment = 0
         self.progress = 0.0
         self.distance_travelled = 0.0
@@ -37,6 +47,42 @@ class Vehicle:
     def completion(self) -> float:
         total = self.total_distance
         return 1.0 if total == 0 else min(1.0, self.distance_travelled / total)
+
+    @property
+    def braking(self) -> bool:
+        return self.target_speed < self.speed - 1e-6
+
+    @property
+    def direction(self) -> np.ndarray:
+        """Unit heading vector in (row, col)."""
+        h = math.radians(self.heading)
+        return np.array([math.sin(h), math.cos(h)])
+
+    def set_target_speed(self, speed: float) -> None:
+        self.target_speed = min(self.cruise_speed, max(0.0, speed))
+
+    def trajectory(self, distances: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """Positions and unit headings (row, col) at the given distances ahead along the route.
+
+        Distances past the goal clamp to the goal.
+        """
+        distances = np.asarray(distances, dtype=float)
+        pts = np.array([self.position] + [tuple(map(float, p)) for p in self.path[self.segment + 1 :]])
+        if len(pts) < 2:
+            return np.repeat(pts, len(distances), axis=0), np.repeat(self.direction[None], len(distances), axis=0)
+        seg = np.diff(pts, axis=0)
+        seg_len = np.hypot(seg[:, 0], seg[:, 1])
+        keep = seg_len > 1e-9
+        if not keep.any():
+            return np.repeat(pts[:1], len(distances), axis=0), np.repeat(self.direction[None], len(distances), axis=0)
+        pts = np.vstack([pts[:1], pts[1:][keep]])
+        seg, seg_len = seg[keep], seg_len[keep]
+        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+        s = np.clip(distances, 0.0, cum[-1])
+        idx = np.clip(np.searchsorted(cum, s, side="right") - 1, 0, len(seg) - 1)
+        frac = (s - cum[idx]) / seg_len[idx]
+        positions = pts[idx] + seg[idx] * frac[:, None]
+        return positions, seg[idx] / seg_len[idx][:, None]
 
     @property
     def anchor(self) -> Cell:
@@ -68,6 +114,12 @@ class Vehicle:
         return abandoned
 
     def update(self, dt: float) -> None:
+        if self.target_speed < self.speed:
+            self.speed = max(self.target_speed, self.speed - self.max_decel * dt)
+        else:
+            self.speed = min(self.target_speed, self.speed + self.max_accel * dt)
+        if self.finished:
+            self.speed = 0.0
         remaining = self.speed * dt
         while remaining > 1e-12 and not self.finished:
             length = self._segment_length(self.segment)
@@ -100,11 +152,16 @@ class Vehicle:
 
     def draw(self, surface: pygame.Surface, renderer) -> None:
         cs = renderer.cell_size
-        length, width = int(cs * 1.1), int(cs * 0.65)
+        length, width = int(cs * 2 * VEHICLE_HALF_LENGTH), max(6, int(cs * 2 * VEHICLE_HALF_WIDTH))
         car = pygame.Surface((length, width), pygame.SRCALPHA)
-        pygame.draw.rect(car, (30, 144, 255), car.get_rect(), border_radius=max(2, cs // 6))
-        pygame.draw.rect(car, (200, 230, 255), pygame.Rect(int(length * 0.6), 2, int(length * 0.22), width - 4), border_radius=2)
-        pygame.draw.rect(car, (255, 255, 200), pygame.Rect(length - 3, 1, 3, 3))
-        pygame.draw.rect(car, (255, 255, 200), pygame.Rect(length - 3, width - 4, 3, 3))
+        radius = max(2, cs // 6)
+        pygame.draw.rect(car, (240, 242, 246), car.get_rect(), border_radius=radius)
+        pygame.draw.rect(car, (30, 34, 44), car.get_rect(), 1, border_radius=radius)
+        pygame.draw.rect(car, (60, 80, 110), pygame.Rect(int(length * 0.55), 2, int(length * 0.22), width - 4), border_radius=2)
+        pygame.draw.rect(car, (255, 240, 150), pygame.Rect(length - 3, 1, 2, 3))
+        pygame.draw.rect(car, (255, 240, 150), pygame.Rect(length - 3, width - 4, 2, 3))
+        tail = (255, 30, 30) if self.braking or (self.speed < 0.05 and not self.finished) else (120, 20, 20)
+        pygame.draw.rect(car, tail, pygame.Rect(0, 1, 3, 3))
+        pygame.draw.rect(car, tail, pygame.Rect(0, width - 4, 3, 3))
         rotated = pygame.transform.rotate(car, -self.heading)
         surface.blit(rotated, rotated.get_rect(center=renderer.to_pixel(self.position)))

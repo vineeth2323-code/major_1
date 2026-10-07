@@ -30,6 +30,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="incident lifetime range in seconds (0 0 = permanent)")
     p.add_argument("--path-bias", type=float, default=0.6, help="probability an incident lands on the route")
     p.add_argument("--max-incidents", type=int, default=6)
+    p.add_argument("--obstacles", type=int, default=8, help="number of moving pedestrians/cyclists")
+    p.add_argument("--no-perception", action="store_true", help="disable moving obstacles and sensors")
+    p.add_argument("--sensor-noise", type=float, default=0.35, help="sensor position noise std (cells)")
+    p.add_argument("--sensor-range", type=float, default=7.0, help="sensor range (cells)")
+    p.add_argument("--no-brake", action="store_true", help="disable the Kalman-based safety brake")
     p.add_argument("--quiet", action="store_true", help="don't print the event log")
     return p.parse_args(argv)
 
@@ -51,6 +56,11 @@ def main(argv=None) -> int:
         incident_duration=None if max(args.incident_duration) <= 0 else tuple(args.incident_duration),
         path_bias=args.path_bias,
         max_incidents=args.max_incidents,
+        perception=not args.no_perception,
+        num_obstacles=args.obstacles,
+        sensor_noise=args.sensor_noise,
+        sensor_range=args.sensor_range,
+        safety_brake=not args.no_brake,
     )
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(message)s")
     exit_on_arrival = args.exit_on_arrival or (args.headless and args.frames is None)
@@ -68,7 +78,9 @@ def main(argv=None) -> int:
         f"path_steps={result.path_length - 1} cost={result.path_cost:g} "
         f"explored={result.explored_nodes} closures={result.closed_segments} "
         f"incidents={result.incidents} reroutes={result.reroutes} "
-        f"safety_violations={result.safety_violations} sim_time={result.sim_time:.1f}s"
+        f"safety_violations={result.safety_violations} collisions={result.collisions} "
+        f"brake_events={result.brake_events} sensor_rmse={result.sensor_rmse:.3f} "
+        f"kf_rmse={result.kf_rmse:.3f} sim_time={result.sim_time:.1f}s"
     )
     return 0
 
