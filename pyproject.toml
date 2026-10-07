@@ -1,0 +1,9 @@
+[project]
+name = "smart-nav"
+version = "0.1.0"
+description = "Smart Navigation and Route Optimization System for autonomous vehicles"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
