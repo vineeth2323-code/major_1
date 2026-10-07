@@ -38,6 +38,35 @@ class Vehicle:
         total = self.total_distance
         return 1.0 if total == 0 else min(1.0, self.distance_travelled / total)
 
+    @property
+    def anchor(self) -> Cell:
+        """Cell the vehicle is committed to reaching next; re-planning starts here."""
+        return self.path[min(self.segment + 1, len(self.path) - 1)]
+
+    @property
+    def committed_cells(self) -> Tuple[Cell, ...]:
+        """Cells the vehicle occupies or can no longer avoid (current segment)."""
+        return tuple(self.path[self.segment : self.segment + 2])
+
+    def cells_ahead(self) -> List[Cell]:
+        """Planned cells beyond the anchor, in driving order."""
+        return self.path[self.segment + 2 :]
+
+    def reroute(self, new_tail: Sequence[Cell]) -> List[Cell]:
+        """Replace the route after the anchor with ``new_tail`` (which must start at the anchor).
+
+        Returns the abandoned part of the old route.
+        """
+        if self.finished:
+            raise RuntimeError("vehicle already arrived")
+        anchor_idx = self.segment + 1
+        new_tail = [tuple(p) for p in new_tail]
+        if not new_tail or new_tail[0] != self.path[anchor_idx]:
+            raise ValueError(f"new route must start at the anchor {self.path[anchor_idx]}")
+        abandoned = self.path[anchor_idx:]
+        self.path = self.path[:anchor_idx] + new_tail
+        return abandoned
+
     def update(self, dt: float) -> None:
         remaining = self.speed * dt
         while remaining > 1e-12 and not self.finished:

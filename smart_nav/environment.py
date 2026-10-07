@@ -76,6 +76,17 @@ class CityGrid:
     def is_road(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols and bool(self.passable[cell])
 
+    def block(self, cell: Cell) -> None:
+        """Dynamically close a road cell (e.g. a V2X incident)."""
+        if not self.is_road(cell):
+            raise ValueError(f"{cell} is not an open road cell")
+        self.passable[cell] = False
+
+    def unblock(self, cell: Cell) -> None:
+        if not (self.is_intersection(cell) or cell[0] % self.block_size == 0 or cell[1] % self.block_size == 0):
+            raise ValueError(f"{cell} is not on a road")
+        self.passable[cell] = True
+
     def segments(self) -> Iterator[Segment]:
         bs = self.block_size
         for r in range(0, self.rows, bs):
@@ -147,7 +158,25 @@ COLORS = {
     "goal": (230, 70, 70),
     "hud_bg": (22, 24, 30),
     "hud_text": (230, 232, 240),
+    "incident": (235, 40, 40),
+    "incident_alt": (255, 200, 40),
+    "pulse": (255, 70, 70),
+    "ghost": (255, 90, 90),
+    "banner": (200, 30, 30),
+    "banner_alt": (240, 120, 20),
+    "log_bg": (16, 18, 24),
+    "log_title": (150, 155, 170),
 }
+
+LOG_COLORS = {
+    "info": (200, 204, 214),
+    "alert": (255, 120, 110),
+    "reroute": (255, 210, 60),
+    "clear": (110, 220, 140),
+}
+
+FLASH_SECONDS = 3.0
+PULSE_SECONDS = 1.5
 
 BUILDING_PALETTE = [
     (120, 110, 100), (104, 116, 128), (136, 120, 96), (96, 112, 104),
@@ -158,15 +187,20 @@ BUILDING_PALETTE = [
 class CityRenderer:
     """Draws a :class:`CityGrid` (plus route and vehicle overlays) onto a Pygame surface."""
 
-    def __init__(self, city: CityGrid, cell_size: int = 20, hud_height: int = 44) -> None:
+    def __init__(self, city: CityGrid, cell_size: int = 20, hud_height: int = 44, log_lines: int = 5) -> None:
         self.city = city
         self.cell_size = cell_size
         self.hud_height = hud_height
+        self.log_lines = log_lines
+        self.log_height = 26 + 17 * log_lines if log_lines else 0
+        self.map_height = city.rows * cell_size
         self.width = city.cols * cell_size
-        self.height = city.rows * cell_size + hud_height
+        self.height = hud_height + self.map_height + self.log_height
         if not pygame.font.get_init():
             pygame.font.init()
         self.font = pygame.font.Font(None, 22)
+        self.log_font = pygame.font.Font(None, 19)
+        self.banner_font = pygame.font.Font(None, 30)
         self.label_font = pygame.font.Font(None, max(14, int(cell_size * 0.9)))
         self._static: Optional[pygame.Surface] = None
 
@@ -241,7 +275,14 @@ class CityRenderer:
         explored: Sequence[Cell] = (),
         vehicle=None,
         hud_lines: Sequence[str] = (),
+        incidents: Sequence = (),
+        now: float = 0.0,
+        ghost_path: Sequence[Cell] = (),
+        ghost_strength: float = 0.0,
+        banner: Optional[str] = None,
+        log_entries: Sequence[Tuple[str, str]] = (),
     ) -> None:
+        """``incidents`` need ``.cell`` and ``.reported_at``; ``log_entries`` are (text, level)."""
         surface.blit(self.static_layer(), (0, 0))
 
         if explored:
@@ -249,6 +290,12 @@ class CityRenderer:
             for cell in explored:
                 overlay.fill(COLORS["explored"], self.cell_rect(cell))
             surface.blit(overlay, (0, 0))
+
+        if len(ghost_path) >= 2 and ghost_strength > 0:
+            ghost = pygame.Surface(self.size, pygame.SRCALPHA)
+            color = (*COLORS["ghost"], int(200 * min(1.0, ghost_strength)))
+            pygame.draw.lines(ghost, color, False, [self.to_pixel(p) for p in ghost_path], max(2, self.cell_size // 6))
+            surface.blit(ghost, (0, 0))
 
         if len(path) >= 2:
             done_upto = vehicle.segment + 1 if vehicle is not None else 0
@@ -263,13 +310,55 @@ class CityRenderer:
             if len(travelled) >= 2:
                 pygame.draw.lines(surface, COLORS["path_done"], False, travelled, max(3, self.cell_size // 5))
 
+        self._draw_incidents(surface, incidents, now)
         self._draw_marker(surface, self.city.start, COLORS["start"], "S")
         self._draw_marker(surface, self.city.goal, COLORS["goal"], "G")
 
         if vehicle is not None:
             vehicle.draw(surface, self)
 
+        if banner:
+            self._draw_banner(surface, banner, now)
         self._draw_hud(surface, hud_lines)
+        self._draw_log(surface, log_entries)
+
+    def _draw_incidents(self, surface: pygame.Surface, incidents: Sequence, now: float) -> None:
+        if not incidents:
+            return
+        pulses = pygame.Surface(self.size, pygame.SRCALPHA)
+        for inc in incidents:
+            age = max(0.0, now - inc.reported_at)
+            rect = self.cell_rect(inc.cell)
+            flash_on = age >= FLASH_SECONDS or int(age / 0.2) % 2 == 0
+            pygame.draw.rect(surface, COLORS["incident"] if flash_on else COLORS["incident_alt"], rect)
+            pygame.draw.rect(surface, (20, 20, 20), rect, 2)
+            glyph = self.label_font.render("!", True, (255, 255, 255) if flash_on else (20, 20, 20))
+            surface.blit(glyph, glyph.get_rect(center=rect.center))
+            if age < PULSE_SECONDS:
+                t = age / PULSE_SECONDS
+                radius = int(self.cell_size * (0.7 + 3.0 * t))
+                pygame.draw.circle(pulses, (*COLORS["pulse"], int(220 * (1 - t))), rect.center, radius, 3)
+        surface.blit(pulses, (0, 0))
+
+    def _draw_banner(self, surface: pygame.Surface, text: str, now: float) -> None:
+        color = COLORS["banner"] if int(now / 0.25) % 2 == 0 else COLORS["banner_alt"]
+        label = self.banner_font.render(text, True, (255, 255, 255))
+        box = label.get_rect(center=(self.width // 2, self.hud_height + 28)).inflate(24, 12)
+        pygame.draw.rect(surface, color, box, border_radius=8)
+        pygame.draw.rect(surface, (255, 255, 255), box, 2, border_radius=8)
+        surface.blit(label, label.get_rect(center=box.center))
+
+    def _draw_log(self, surface: pygame.Surface, entries: Sequence[Tuple[str, str]]) -> None:
+        if not self.log_height:
+            return
+        top = self.hud_height + self.map_height
+        pygame.draw.rect(surface, COLORS["log_bg"], pygame.Rect(0, top, self.width, self.log_height))
+        pygame.draw.line(surface, COLORS["log_title"], (0, top), (self.width, top), 1)
+        surface.blit(self.log_font.render("V2X / NAVIGATION LOG", True, COLORS["log_title"]), (8, top + 6))
+        y = top + 24
+        for text, level in list(entries)[-self.log_lines :]:
+            surface.blit(self.log_font.render(text, True, LOG_COLORS.get(level, LOG_COLORS["info"])), (8, y))
+            y += 17
 
     def _draw_marker(self, surface: pygame.Surface, cell: Cell, color, label: str) -> None:
         center = self.to_pixel(cell)

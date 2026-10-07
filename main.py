@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 from smart_nav.simulation import Simulation, SimulationConfig
 
@@ -23,6 +24,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--speed", type=float, default=6.0, help="vehicle speed in cells/second")
     p.add_argument("--random-endpoints", action="store_true")
     p.add_argument("--hide-explored", action="store_true")
+    p.add_argument("--no-v2x", action="store_true", help="disable spontaneous V2X incidents")
+    p.add_argument("--incident-rate", type=float, default=0.3, help="V2X incidents per simulated second")
+    p.add_argument("--incident-duration", type=float, nargs=2, default=(12.0, 25.0), metavar=("MIN", "MAX"),
+                   help="incident lifetime range in seconds (0 0 = permanent)")
+    p.add_argument("--path-bias", type=float, default=0.6, help="probability an incident lands on the route")
+    p.add_argument("--max-incidents", type=int, default=6)
+    p.add_argument("--quiet", action="store_true", help="don't print the event log")
     return p.parse_args(argv)
 
 
@@ -38,7 +46,13 @@ def main(argv=None) -> int:
         speed=args.speed,
         random_endpoints=args.random_endpoints,
         show_explored=not args.hide_explored,
+        v2x=not args.no_v2x,
+        incident_rate=args.incident_rate,
+        incident_duration=None if max(args.incident_duration) <= 0 else tuple(args.incident_duration),
+        path_bias=args.path_bias,
+        max_incidents=args.max_incidents,
     )
+    logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(message)s")
     exit_on_arrival = args.exit_on_arrival or (args.headless and args.frames is None)
     sim = Simulation(config, headless=args.headless)
     try:
@@ -52,7 +66,9 @@ def main(argv=None) -> int:
     print(
         f"frames={result.frames} reached_goal={result.reached_goal} "
         f"path_steps={result.path_length - 1} cost={result.path_cost:g} "
-        f"explored={result.explored_nodes} closures={result.closed_segments}"
+        f"explored={result.explored_nodes} closures={result.closed_segments} "
+        f"incidents={result.incidents} reroutes={result.reroutes} "
+        f"safety_violations={result.safety_violations} sim_time={result.sim_time:.1f}s"
     )
     return 0
 
